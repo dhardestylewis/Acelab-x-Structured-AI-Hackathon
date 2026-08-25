@@ -17,3 +17,7 @@ assets/datasets/validation/
 
 # Provisioned event keys — never commit
 team-keys.csv
+
+# Local OpenRouter credentials
+.env
+.env.local

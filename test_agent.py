@@ -30,6 +30,17 @@ class AgentTests(unittest.TestCase):
             self.assertIn("errors", parsed)
             self.assertEqual(len(parsed["errors"]), 0)
 
+    def test_finds_plain_text_same_mark_conflict(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "spec.txt").write_text("P-101 pipe shall be 2 in minimum.", encoding="utf-8")
+            (root / "drawing.txt").write_text("P-101 pipe shown as 1.5 in.", encoding="utf-8")
+            docs = agent.read_documents(root)
+            findings = agent.anchored_numeric_errors(docs)
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0]["document"], "drawing.txt")
+            self.assertIn("2 in", findings[0]["description"])
+
 
 if __name__ == "__main__":
     unittest.main()

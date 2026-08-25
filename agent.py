@@ -19,6 +19,25 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
+def load_local_env() -> None:
+    """Load simple KEY=VALUE entries from the local, untracked env file."""
+    env_path = Path(__file__).with_name(".env.local")
+    if not env_path.is_file():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.strip()
+        value = value.strip().strip('"').strip("'")
+        if name:
+            os.environ.setdefault(name, value)
+
+
+load_local_env()
+
+
 MAX_SECONDS = 9 * 60 + 30
 MAX_CALLS = 300
 MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4.1")
@@ -88,6 +107,38 @@ def first_number(pattern: str, text: str) -> str | None:
     return match.group(1) if match else None
 
 
+def canonical_unit(unit: str) -> str:
+    value = unit.lower().rstrip(".")
+    aliases = {
+        "minute": "min", "minutes": "min", "min": "min",
+        "hour": "hr", "hours": "hr", "hr": "hr",
+        "inch": "in", "inches": "in", "in": "in",
+        "feet": "ft", "foot": "ft", "ft": "ft",
+    }
+    return aliases.get(value, value)
+
+
+def unit_family(unit: str) -> str:
+    if unit in {"min", "hr"}:
+        return "time"
+    if unit in {"in", "ft", "mm", "cm"}:
+        return "length"
+    return unit
+
+
+def normalized_measure(value: str, unit: str) -> float:
+    amount = float(value.replace(",", ""))
+    if unit == "hr":
+        return amount * 60
+    if unit == "ft":
+        return amount * 12
+    if unit == "mm":
+        return amount / 25.4
+    if unit == "cm":
+        return amount / 2.54
+    return amount
+
+
 def spec_sentences(documents: dict[str, list[str]]) -> list[tuple[str, int, str]]:
     sentences: list[tuple[str, int, str]] = []
     for name, page, text in page_texts(documents):
@@ -133,6 +184,101 @@ def row_value(row: dict[str, str], names: tuple[str, ...], pattern: str) -> str 
         if value is not None:
             return value
     return None
+
+
+def numeric_claims(documents: dict[str, list[str]]) -> list[dict[str, object]]:
+    unit_pattern = r"(?:minutes?|min|hours?|hr|gpm|gpf|cfm|psi|mph|mm|cm|in\.?|inch(?:es)?|ft|feet|%)"
+    claims: list[dict[str, object]] = []
+    for name, pages in documents.items():
+        for page_no, text in enumerate(pages, 1):
+            for line in text.splitlines():
+                line = re.sub(r"\s+", " ", line).strip(" |-")
+                if not line:
+                    continue
+                anchors = set(re.findall(r"\b[A-Z]{1,6}-\d{1,5}\b", line))
+                if not anchors:
+                    continue
+                for match in re.finditer(r"(?<![A-Za-z])([0-9]+(?:\.[0-9]+)?)[-\s]*(" + unit_pattern + r")\b", line, re.I):
+                    claims.append({
+                        "document": name,
+                        "page": page_no,
+                        "anchor": sorted(anchors)[0],
+                        "value": match.group(1),
+                        "unit": canonical_unit(match.group(2)),
+                        "family": unit_family(canonical_unit(match.group(2))),
+                        "normalized": normalized_measure(match.group(1), canonical_unit(match.group(2))),
+                        "line": line[:500],
+                        "authoritative": bool(re.search(r"\b(shall|must|required|requires|maximum|minimum|code|per)\b", line, re.I)),
+                    })
+    return claims
+
+
+def anchored_numeric_errors(documents: dict[str, list[str]]) -> list[dict[str, str]]:
+    claims = numeric_claims(documents)
+    groups: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for claim in claims:
+        groups.setdefault((str(claim["anchor"]), str(claim["family"])), []).append(claim)
+    findings: list[dict[str, str]] = []
+    rate_units = {"gpm", "gpf", "cfm", "psi", "mph", "%"}
+    for (anchor, family), members in groups.items():
+        values = {round(float(member["normalized"]), 6) for member in members}
+        docs = {str(member["document"]) for member in members}
+        if len(values) < 2 or len(docs) < 2:
+            continue
+        authorities = [member for member in members if member["authoritative"]]
+        if len({str(member["document"]) for member in authorities}) != 1:
+            continue
+        authoritative_value = float(authorities[0]["normalized"])
+        for member in members:
+            if round(float(member["normalized"]), 6) == round(authoritative_value, 6) or str(member["document"]) == str(authorities[0]["document"]):
+                continue
+            if re.search(r"\b(code|nec|ada|ansi|iecc)\b", str(authorities[0]["line"]), re.I):
+                category = "code-violation"
+            else:
+                category = "unit-error" if family in rate_units else "cross-document-conflict"
+            findings.append(error(
+                str(member["document"]),
+                category,
+                f"page {member['page']}, {anchor}",
+                f"{anchor} is listed at {member['value']} {member['unit']}; the authoritative requirement is {authorities[0]['value']} {authorities[0]['unit']}. Source: {member['line']}",
+            ))
+    return findings
+
+
+def missing_item_errors(documents: dict[str, list[str]]) -> list[dict[str, str]]:
+    """Handle only explicit requirements that name a schedule inclusion."""
+    findings: list[dict[str, str]] = []
+    for source_name, pages in documents.items():
+        for page_no, text in enumerate(pages, 1):
+            for line in text.splitlines():
+                if not re.search(r"\b(schedule|table|list)\b", line, re.I):
+                    continue
+                if not re.search(r"\b(shall|must|required|include|provide)\b", line, re.I):
+                    continue
+                anchors = set(re.findall(r"\b[A-Z]{1,6}-\d{1,5}\b", line))
+                for anchor in anchors:
+                    present_elsewhere = any(
+                        anchor in other_text
+                        for other_name, other_pages in documents.items()
+                        if other_name != source_name
+                        for other_text in other_pages
+                    )
+                    if present_elsewhere:
+                        continue
+                    targets = [
+                        other_name for other_name in documents
+                        if other_name != source_name and re.search(r"schedule|table|drawing", other_name, re.I)
+                    ]
+                    if not targets:
+                        continue
+                    target = targets[0]
+                    findings.append(error(
+                        target,
+                        "missing-item",
+                        f"page {page_no}, {anchor}",
+                        f"{anchor} is required in the schedule but is missing. Requirement: {line.strip()[:400]}",
+                    ))
+    return findings
 
 
 def deterministic_errors(documents: dict[str, list[str]]) -> list[dict[str, str]]:
@@ -259,6 +405,9 @@ def validate_llm_errors(parsed: dict, documents: dict[str, list[str]]) -> list[d
         description = str(item.get("description", ""))
         if document not in valid_documents or category not in valid_categories or not description:
             continue
+        evidence = str(item.get("evidence", "")).strip()
+        if evidence and evidence.lower() not in description.lower():
+            description = f"{description} Evidence: {evidence}"
         results.append(error(document, category, location[:300], description[:1000]))
     return results
 
@@ -326,7 +475,7 @@ def main() -> int:
     if not documents:
         print(f"No readable documents found under {dataset_dir}", file=sys.stderr)
         return 2
-    errors = deduplicate(deterministic_errors(documents) + llm_errors(documents, budget))
+    errors = deduplicate(anchored_numeric_errors(documents) + deterministic_errors(documents) + missing_item_errors(documents) + llm_errors(documents, budget))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps({"errors": errors}, indent=2) + "\n", encoding="utf-8")
     print(f"Wrote {len(errors)} errors to {output_path}; LLM calls: {budget.calls}")
