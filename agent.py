@@ -21,7 +21,7 @@ from urllib.request import Request, urlopen
 
 MAX_SECONDS = 9 * 60 + 30
 MAX_CALLS = 300
-MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash")
 
 
 class Budget:
@@ -219,33 +219,17 @@ def parse_json(text: str) -> dict:
             return {}
 
 
-def llm_errors(documents: dict[str, list[str]], budget: Budget) -> list[dict[str, str]]:
-    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not key or not budget.reserve() or len(documents) < 2:
-        return []
-    prompt = """You review an architectural/construction document set with deliberately injected errors.
-Find only material errors in these categories: cross-document-conflict, code-violation,
-unit-error, or missing-item. Be conservative: omit anything uncertain.
-
-Return ONLY this JSON shape:
-{"errors":[{"document":"exact file name containing the INCORRECT information",
-"category":"cross-document-conflict|code-violation|unit-error|missing-item",
-"location":"page, section, table, mark, or item",
-"description":"one sentence quoting the wrong value and the correct value"}]}
-
-Rules:
-- The document field must be an exact file name from the supplied set.
-- Report the document containing the incorrect value, not the document containing the requirement.
-- For conflicts, identify both the wrong and correct values in description.
-- Do not duplicate the same error.
-
-DOCUMENT SET:
-""" + corpus(documents)
+def call_llm(prompt: str, key: str, budget: Budget) -> dict:
+    if not budget.reserve():
+        return {}
     payload = json.dumps({
         "model": MODEL,
         "temperature": 0,
-        "max_tokens": 6000,
-        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 7000,
+        "messages": [
+            {"role": "system", "content": "You are a meticulous construction-document auditor. Never stop after the first error."},
+            {"role": "user", "content": prompt},
+        ],
     }).encode()
     request = Request(
         "https://openrouter.ai/api/v1/chat/completions",
@@ -256,10 +240,13 @@ DOCUMENT SET:
     try:
         with urlopen(request, timeout=75) as response:
             data = json.loads(response.read().decode())
-        parsed = parse_json(data["choices"][0]["message"]["content"])
+        return parse_json(data["choices"][0]["message"]["content"])
     except (HTTPError, URLError, TimeoutError, KeyError, IndexError, json.JSONDecodeError) as exc:
         print(f"LLM review unavailable: {exc}", file=sys.stderr)
-        return []
+        return {}
+
+
+def validate_llm_errors(parsed: dict, documents: dict[str, list[str]]) -> list[dict[str, str]]:
     valid_categories = {"cross-document-conflict", "code-violation", "unit-error", "missing-item"}
     valid_documents = set(documents)
     results: list[dict[str, str]] = []
@@ -274,6 +261,47 @@ DOCUMENT SET:
             continue
         results.append(error(document, category, location[:300], description[:1000]))
     return results
+
+
+def llm_errors(documents: dict[str, list[str]], budget: Budget) -> list[dict[str, str]]:
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not key or len(documents) < 2:
+        return []
+    document_names = ", ".join(documents)
+    discovery = """Audit this complete construction document set for every deliberately injected error.
+Search systematically across every document pair and every page. Check drawings against
+schedules and specifications, schedules against schedules, numeric values and units,
+equipment and material identifiers, code requirements, and items present in one document
+but required or expected in another. Do not stop after the first finding.
+
+Return JSON only in this shape. Include a short exact evidence quote in each internal
+evidence field so another auditor can verify it:
+{"errors":[{"document":"exact incorrect file name",
+"category":"cross-document-conflict|code-violation|unit-error|missing-item",
+"location":"page, section, table, sheet, or mark",
+"description":"one sentence quoting the wrong value and the correct value",
+"evidence":"short exact quote or two quotes from the source documents"}]}
+
+The incorrect document is the file named in document. For a conflict, do not name the
+file containing only the correct requirement. Use exact file names from this list:
+""" + document_names + "\n\nDOCUMENT SET:\n" + corpus(documents)
+    first = call_llm(discovery, key, budget)
+    candidates = first.get("errors", []) if isinstance(first, dict) else []
+    adjudication = """Independently verify the candidate findings against the document set below.
+Recover omissions by searching the full set again. Keep every material planted error that
+is supported, correct the incorrect-document attribution when necessary, and remove only
+unsupported or duplicate guesses. The final answer must include all four allowed categories
+when supported, not merely the first error found.
+
+Return JSON only as {"errors":[...]} with exactly these fields:
+document, category, location, description.
+The document must be an exact file name and must contain the incorrect information.
+Descriptions must state the wrong and correct values or clearly state the missing item.
+
+CANDIDATES FROM THE FIRST AUDITOR:
+""" + json.dumps(candidates, ensure_ascii=False) + "\n\nDOCUMENT SET:\n" + corpus(documents)
+    second = call_llm(adjudication, key, budget)
+    return validate_llm_errors(second if isinstance(second, dict) else {}, documents)
 
 
 def deduplicate(errors: list[dict[str, str]]) -> list[dict[str, str]]:
