@@ -21,7 +21,7 @@ from urllib.request import Request, urlopen
 
 MAX_SECONDS = 9 * 60 + 30
 MAX_CALLS = 300
-MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash")
+MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4.1")
 
 
 class Budget:
